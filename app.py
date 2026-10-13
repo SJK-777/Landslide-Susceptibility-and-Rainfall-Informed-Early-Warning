@@ -1,6 +1,6 @@
-import os
 from pathlib import Path
 from datetime import datetime, timezone
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -11,100 +11,131 @@ import plotly.graph_objects as go
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score
-import joblib
 
-st.set_page_config(page_title="India Landslide Watch", page_icon="⛰️", layout="wide")
-
-ROOT = Path(__file__).parent
-DATA_CANDIDATES = [
-    ROOT / "INDIA_LANDSLIDE_FINAL_SUSCEPTIBILITY_TRAINING.csv",
-    ROOT / "data" / "INDIA_LANDSLIDE_FINAL_SUSCEPTIBILITY_TRAINING.csv",
-    ROOT / "INDIA_MODELLING_DATASET_WITH_VERIFIED_PREDICTORS.csv",
-]
-MODEL_PATH = ROOT / "model.joblib"
-FEATURES_PATH = ROOT / "model_features.json"
+# ------------------------------ PAGE / THEME ------------------------------
+st.set_page_config(
+    page_title="India Landslide Watch",
+    page_icon="⛰️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-.small-note {font-size: 0.88rem; color: #687385;}
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+.stApp { background: radial-gradient(circle at 80% 0%, rgba(38,95,94,.22), transparent 28%), #0b1220; }
+.block-container { max-width: 1450px; padding-top: 1.35rem; padding-bottom: 3rem; }
+[data-testid="stSidebar"] { background: #101a2b; border-right: 1px solid #26344b; }
+.hero { padding: 1.6rem 1.8rem; border: 1px solid #26384b; border-radius: 22px;
+        background: linear-gradient(120deg, rgba(24,54,68,.96), rgba(17,27,44,.98)); margin-bottom: 1rem; }
+.hero h1 { font-family: 'Manrope', sans-serif; letter-spacing: -1.4px; font-size: clamp(2rem, 4vw, 3.2rem); margin: 0; }
+.hero p { color: #b8c8d7; margin: .45rem 0 0 0; font-size: 1rem; }
+.eyebrow { color: #78d6c6; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; font-size: .72rem; }
+.section-title { font-family: 'Manrope', sans-serif; font-size: 1.35rem; font-weight: 800; margin: 1.15rem 0 .25rem; }
+.muted { color: #9caec2; font-size: .9rem; }
+div[data-testid="stMetric"] { background: #121e30; border: 1px solid #26384b; padding: 1rem 1.1rem; border-radius: 16px; }
+div[data-testid="stMetricLabel"] { color: #a8b8ca; }
+div[data-testid="stMetricValue"] { font-family: 'Manrope', sans-serif; }
+div.stButton > button { border-radius: 11px; min-height: 2.8rem; font-weight: 700; }
+div[data-testid="stAlert"] { border-radius: 14px; }
+hr { border-color: #26384b; }
+footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⛰️ India Landslide Watch")
-st.caption("Research prototype · Susceptibility screening + rainfall-informed advisory")
+ROOT = Path(__file__).parent
+CSV_NAME = "INDIA_LANDSLIDE_FINAL_SUSCEPTIBILITY_TRAINING.csv"
+CANDIDATES = [
+    ROOT / CSV_NAME,
+    ROOT / "data" / CSV_NAME,
+    ROOT / "INDIA_MODELLING_DATASET_WITH_VERIFIED_PREDICTORS.csv",
+]
+
+st.markdown("""
+<div class="hero">
+  <div class="eyebrow">Geospatial intelligence · Research prototype</div>
+  <h1>⛰️ India Landslide Watch</h1>
+  <p>Location-based susceptibility screening with rainfall context — designed for transparent research, not as an official alert service.</p>
+</div>
+""", unsafe_allow_html=True)
 
 st.warning(
-    "Prototype only — not an official warning service. The susceptibility model is trained from historical "
-    "event/background samples, and background points are not confirmed non-landslide locations. Rainfall "
-    "advisory levels below are transparent screening rules, not validated warning thresholds. Do not use "
-    "this dashboard for evacuation or life-safety decisions."
+    "RESEARCH PROTOTYPE — Do not use for evacuation or life-safety decisions. "
+    "Sampled background points are not confirmed non-landslide locations. The model score is not a calibrated "
+    "real-world event probability, and rainfall bands are provisional screening rules rather than validated thresholds."
 )
 
-@st.cache_data(show_spinner=False)
-def load_training_csv(path_str):
-    return pd.read_csv(path_str, low_memory=False)
+# ------------------------------ DATA HELPERS ------------------------------
+LABEL_NAMES = ["label", "target", "class", "landslide_label"]
+DROP_COLS = {
+    "source_record_id", "sample_type", "label_interpretation", "spatial_block_id",
+    "predictor_source_elevation", "predictor_source_slope_aspect",
+    "predictor_source_landcover", "predictor_source_ndvi",
+    "event_date", "date", "longitude", "latitude"
+}
 
-def find_data(uploaded):
-    if uploaded is not None:
-        return pd.read_csv(uploaded, low_memory=False), "Uploaded CSV"
-    for p in DATA_CANDIDATES:
-        if p.exists():
-            return load_training_csv(str(p)), str(p.name)
-    return None, None
-
-def build_model(df):
-    label_col = next((c for c in ["label", "target", "class", "landslide_label"] if c in df.columns), None)
-    if label_col is None:
-        raise ValueError("Could not find a label column. Expected a column named 'label'.")
-    y_raw = df[label_col]
-    if y_raw.dtype == object:
-        y_text = y_raw.astype(str).str.strip().str.lower()
-        mapping = {"1": 1, "true": 1, "landslide": 1, "event": 1, "positive": 1,
-                   "0": 0, "false": 0, "background": 0, "non-landslide": 0, "negative": 0}
-        y = y_text.map(mapping)
-        if y.isna().any():
-            y = pd.to_numeric(y_raw, errors="coerce")
+def safe_label(series):
+    """Return binary labels without truth-testing pd.NA."""
+    if pd.api.types.is_numeric_dtype(series):
+        y = pd.to_numeric(series, errors="coerce")
     else:
-        y = pd.to_numeric(y_raw, errors="coerce")
-    valid = y.isin([0, 1])
-    df = df.loc[valid].copy()
-    y = y.loc[valid].astype(int)
-    excluded = {
-        label_col, "source_record_id", "sample_type", "label_interpretation",
-        "spatial_block_id", "predictor_source_elevation", "predictor_source_slope_aspect",
-        "predictor_source_landcover", "predictor_source_ndvi", "event_date", "date",
-        "longitude", "latitude"
-    }
-    candidates = [c for c in df.columns if c not in excluded]
-    # Use only useful predictors, excluding columns that are wholly missing or identifiers.
-    candidates = [c for c in candidates if df[c].notna().sum() > 0 and
-                  pd.to_numeric(df[c], errors="coerce").notna().sum() > 0]
-    # Preserve landcover as categorical despite integer codes.
-    if "landcover_class" in df.columns and "landcover_class" not in candidates:
-        candidates.append("landcover_class")
+        s = series.astype("string").str.strip().str.lower()
+        mapping = {
+            "1": 1, "true": 1, "landslide": 1, "event": 1, "positive": 1,
+            "0": 0, "false": 0, "background": 0, "non-landslide": 0, "negative": 0,
+        }
+        y = s.map(mapping)
+        # Try numeric conversion only for values not handled by the map.
+        y = y.where(y.notna(), pd.to_numeric(s, errors="coerce"))
+    return y
+
+def make_model(df):
+    label_col = next((c for c in LABEL_NAMES if c in df.columns), None)
+    if label_col is None:
+        raise ValueError("No binary label column found. Expected 'label' in the training CSV.")
+
+    y_all = safe_label(df[label_col])
+    valid = y_all.notna() & y_all.isin([0, 1])
+    clean = df.loc[valid].copy()
+    y = y_all.loc[valid].astype(int)
+
+    if y.nunique() != 2:
+        raise ValueError(f"Training data must contain both classes 0 and 1. Found labels: {sorted(y.unique().tolist())}")
+
+    # Keep numeric predictor columns and land-cover categorical. Exclude IDs, labels and coordinates.
+    candidates = []
+    for c in clean.columns:
+        if c == label_col or c in DROP_COLS:
+            continue
+        if c == "landcover_class":
+            if clean[c].notna().any():
+                candidates.append(c)
+        elif pd.to_numeric(clean[c], errors="coerce").notna().any():
+            candidates.append(c)
+
     if not candidates:
-        raise ValueError("No usable predictor columns found in the supplied training CSV.")
-    X = df[candidates].copy()
-    cat_cols = [c for c in candidates if c == "landcover_class" or X[c].dtype == "object"]
+        raise ValueError("No usable predictor columns were found.")
+
+    X = clean[candidates].copy()
+    cat_cols = [c for c in candidates if c == "landcover_class" or X[c].dtype == "object" or str(X[c].dtype).startswith("string")]
     num_cols = [c for c in candidates if c not in cat_cols]
+
     for c in num_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce")
+        X[c] = X[c].replace([np.inf, -np.inf], np.nan)
     for c in cat_cols:
-        X[c] = X[c].astype("string")
+        X[c] = X[c].astype("string").fillna("Unknown").astype(str)
+
     transformers = []
     if num_cols:
-        transformers.append(("num", Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler())
-        ]), num_cols))
+        transformers.append(("numeric", SimpleImputer(strategy="median", keep_empty_features=True), num_cols))
     if cat_cols:
-        transformers.append(("cat", Pipeline([
+        transformers.append(("categorical", Pipeline([
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore"))
+            ("onehot", OneHotEncoder(handle_unknown="ignore")),
         ]), cat_cols))
     prep = ColumnTransformer(transformers, remainder="drop")
     model = Pipeline([
@@ -112,183 +143,225 @@ def build_model(df):
         ("classifier", RandomForestClassifier(
             n_estimators=350, min_samples_leaf=2, class_weight="balanced",
             random_state=20261014, n_jobs=-1
-        ))
+        )),
     ])
     model.fit(X, y)
-    return model, candidates, num_cols, cat_cols, label_col, int((y == 1).sum()), int((y == 0).sum())
+    return model, candidates, num_cols, cat_cols, label_col, clean, y
 
-@st.cache_resource(show_spinner="Loading the historical dataset and fitting the dashboard model…")
-def get_model(csv_path):
-    df = pd.read_csv(csv_path, low_memory=False)
-    return build_model(df)
+@st.cache_data(show_spinner=False)
+def load_csv_bytes(file_bytes):
+    import io
+    return pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
 
+@st.cache_data(show_spinner=False)
+def read_local_csv(path):
+    return pd.read_csv(path, low_memory=False)
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_forecast(lat, lon, days):
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "precipitation_sum,precipitation_probability_max",
+            "forecast_days": days,
+            "timezone": "auto",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.json()
+
+# ------------------------------ SIDEBAR ------------------------------
 with st.sidebar:
-    st.header("Data & location")
-    uploaded = st.file_uploader("Optional: upload your training CSV", type=["csv"])
-    st.markdown("**Default expected file**")
-    st.code("INDIA_LANDSLIDE_FINAL_SUSCEPTIBILITY_TRAINING.csv")
-    st.caption("Place this CSV beside app.py in the GitHub repository, or upload it here for a local session.")
-    lat = st.number_input("Latitude", min_value=6.0, max_value=37.5, value=11.40, step=0.05, format="%.4f")
-    lon = st.number_input("Longitude", min_value=68.0, max_value=97.5, value=76.70, step=0.05, format="%.4f")
-    forecast_days = st.selectbox("Forecast horizon", [1, 3, 7], index=1)
+    st.markdown("## Control centre")
+    st.caption("Configure a site and load the training data.")
+    uploaded = st.file_uploader("Upload training CSV", type=["csv"])
+    st.markdown("**Expected repository file**")
+    st.code(CSV_NAME, language=None)
+    st.caption("Upload the file to the GitHub repo beside app.py, or use the uploader above.")
+    st.divider()
+    st.markdown("### Assessment location")
+    lat = st.number_input("Latitude", min_value=6.0, max_value=37.5, value=11.40, step=0.01, format="%.4f")
+    lon = st.number_input("Longitude", min_value=68.0, max_value=97.5, value=76.70, step=0.01, format="%.4f")
+    horizon = st.selectbox("Rainfall forecast horizon", [1, 3, 7], index=1)
+    st.divider()
+    st.markdown("<div class='muted'>India-wide coordinates are accepted. Predictor values are not auto-extracted from a nationwide raster in this version.</div>", unsafe_allow_html=True)
 
-# Load data / model
-training_df = None
-model = None
-features = []
-num_cols = []
-cat_cols = []
-positive_n = negative_n = 0
-data_source = None
+# ------------------------------ LOAD / FIT ------------------------------
+df = None
+source = None
 try:
     if uploaded is not None:
-        training_df = pd.read_csv(uploaded, low_memory=False)
-        data_source = "Uploaded CSV"
-        model, features, num_cols, cat_cols, label_col, positive_n, negative_n = build_model(training_df)
+        df = load_csv_bytes(uploaded.getvalue())
+        source = "Uploaded CSV"
     else:
-        path = next((p for p in DATA_CANDIDATES if p.exists()), None)
-        if path is not None:
-            data_source = path.name
-            model, features, num_cols, cat_cols, label_col, positive_n, negative_n = get_model(str(path))
-            training_df = load_training_csv(str(path))
-except Exception as e:
-    st.error(f"Could not load/train the model: {e}")
+        local = next((p for p in CANDIDATES if p.exists()), None)
+        if local:
+            df = read_local_csv(str(local))
+            source = local.name
+except Exception as exc:
+    st.error(f"Could not read the CSV: {exc}")
+    st.stop()
 
-if model is None:
+if df is None:
     st.info(
-        "The dashboard needs your training CSV. Add "
-        "`INDIA_LANDSLIDE_FINAL_SUSCEPTIBILITY_TRAINING.csv` to the repository root "
-        "or upload it in the sidebar. This app intentionally does not invent model results."
+        f"**Training CSV required.** Add `{CSV_NAME}` to the GitHub repository root or upload it in the left sidebar. "
+        "The app will not invent a dataset or display a fabricated prediction."
     )
     st.stop()
 
-# Fetch forecast from Open-Meteo (no API key generally required).
-@st.cache_data(ttl=900, show_spinner=False)
-def get_forecast(latitude, longitude, days):
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": latitude, "longitude": longitude,
-        "daily": "precipitation_sum,precipitation_probability_max",
-        "forecast_days": days, "timezone": "auto"
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+try:
+    with st.spinner("Preparing data and fitting the dashboard model…"):
+        model, features, num_cols, cat_cols, label_col, clean_df, y = make_model(df)
+except Exception as exc:
+    st.error(f"**Model setup failed:** {exc}")
+    st.markdown(
+        "Check that the CSV contains a binary `label` column with both `1` (recorded event) and `0` "
+        "(sampled background), plus predictor columns such as elevation, slope, NDVI and land-cover class."
+    )
+    st.stop()
 
-# Create editable point predictors using training medians/modes.
-def default_value(col):
-    if training_df is None or col not in training_df.columns:
-        return 0.0
-    s = training_df[col]
-    if col == "landcover_class":
-        mode = s.dropna().mode()
-        return str(mode.iloc[0]) if len(mode) else "Unknown"
-    vals = pd.to_numeric(s, errors="coerce").dropna()
+# ------------------------------ TOPLINE ------------------------------
+st.markdown("<div class='section-title'>Overview</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='muted'>Source: {source} · Model fitted on app startup · Label field: `{label_col}`</div>", unsafe_allow_html=True)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Usable training rows", f"{len(clean_df):,}")
+k2.metric("Recorded-event labels", f"{int((y == 1).sum()):,}")
+k3.metric("Sampled-background labels", f"{int((y == 0).sum()):,}")
+k4.metric("Predictor fields", f"{len(features)}")
+
+st.markdown("<div class='section-title'>1 · Site susceptibility screening</div>", unsafe_allow_html=True)
+st.markdown("<div class='muted'>Edit the environmental predictors for the selected site. Initial values use dataset medians/modes and are not coordinate-specific measurements.</div>", unsafe_allow_html=True)
+
+def default_value(c):
+    if c == "landcover_class":
+        modes = clean_df[c].dropna().astype(str).mode()
+        return modes.iloc[0] if len(modes) else "Unknown"
+    vals = pd.to_numeric(clean_df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
     return float(vals.median()) if len(vals) else 0.0
 
-st.subheader("1 · Susceptibility screening")
-st.write(f"**Training source:** `{data_source}` · **Model:** Random Forest classifier · "
-         f"**Training rows:** {len(training_df):,} · **Event-labelled rows:** {positive_n:,} · "
-         f"**Background-labelled rows:** {negative_n:,}")
-st.caption("The app fits a reproducible Random Forest to the supplied CSV when it starts. This is not automatically the same fitted model or cross-validation result reported in the research evaluation.")
-
-with st.expander("Edit site predictors", expanded=True):
-    st.caption("Enter values for the selected coordinate. Defaults are training-data medians/modes; they are not extracted automatically for this coordinate.")
+with st.expander("Environmental predictor inputs", expanded=True):
     site = {}
-    cols_ui = st.columns(3)
+    ui_cols = st.columns(3)
     for i, c in enumerate(features):
-        default = default_value(c)
-        with cols_ui[i % 3]:
+        with ui_cols[i % 3]:
             if c in cat_cols:
-                choices = sorted(training_df[c].dropna().astype(str).unique().tolist()) if c in training_df else []
-                if choices:
-                    val = st.selectbox(c, choices, index=choices.index(default) if default in choices else 0)
+                options = sorted(clean_df[c].dropna().astype(str).unique().tolist())
+                default = str(default_value(c))
+                if options:
+                    site[c] = st.selectbox(c, options, index=options.index(default) if default in options else 0, key=f"cat_{c}")
                 else:
-                    val = st.text_input(c, value=str(default))
-                site[c] = str(val)
+                    site[c] = st.text_input(c, value=default, key=f"cattext_{c}")
             else:
-                val = st.number_input(c, value=float(default), format="%.4f", key=f"pred_{c}")
-                site[c] = float(val)
+                site[c] = st.number_input(c, value=float(default_value(c)), format="%.4f", key=f"num_{c}")
 
-input_df = pd.DataFrame([site], columns=features)
+if st.button("Run site screening", type="primary", use_container_width=True):
+    st.session_state["site_inputs"] = site
+    st.session_state["site_probability"] = None
+
+site = st.session_state.get("site_inputs", site)
+input_df = pd.DataFrame([{c: site[c] for c in features}], columns=features)
+for c in num_cols:
+    input_df[c] = pd.to_numeric(input_df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+for c in cat_cols:
+    input_df[c] = input_df[c].astype("string").fillna("Unknown").astype(str)
+
 try:
-    probability = float(model.predict_proba(input_df)[0, list(model.classes_).index(1)])
-except Exception as e:
-    st.error(f"Prediction failed: {e}")
+    probs = model.predict_proba(input_df)[0]
+    class_index = list(model.classes_).index(1)
+    probability = float(probs[class_index])
+except Exception as exc:
+    st.error(f"Prediction failed for the selected predictors: {exc}")
     st.stop()
 
 if probability >= 0.70:
-    sus_label, sus_color = "Higher relative susceptibility", "🔴"
+    level, emoji = "Higher relative susceptibility", "🔴"
+    description = "This model score is in the higher screening band; it is not a warning that a landslide will occur."
 elif probability >= 0.40:
-    sus_label, sus_color = "Moderate relative susceptibility", "🟠"
+    level, emoji = "Moderate relative susceptibility", "🟠"
+    description = "This model score is in the middle screening band; confirm local conditions and official information."
 else:
-    sus_label, sus_color = "Lower relative susceptibility", "🟢"
+    level, emoji = "Lower relative susceptibility", "🟢"
+    description = "This model score is in the lower screening band; it does not rule out a landslide."
+a, b, c = st.columns([1, 1, 1.4])
+a.metric("Event-class model score", f"{probability:.1%}")
+b.metric("Screening band", level)
+c.metric("Coordinate", f"{lat:.4f}, {lon:.4f}")
+st.progress(min(max(probability, 0.0), 1.0), text="Relative model score — not a calibrated event probability")
+st.info(f"{emoji} {description}")
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Model score for event class", f"{probability:.1%}")
-m2.metric("Screening category", sus_label)
-m3.metric("Selected coordinate", f"{lat:.3f}, {lon:.3f}")
-st.caption("Score is a model output for this case/background sampling design, not a calibrated probability that a landslide will occur.")
+# ------------------------------ RAINFALL ------------------------------
+st.markdown("<div class='section-title'>2 · Forecast rainfall context</div>", unsafe_allow_html=True)
+st.markdown("<div class='muted'>Forecast from Open-Meteo. Rainfall is displayed alongside susceptibility; it is not fed into this classifier.</div>", unsafe_allow_html=True)
 
-st.subheader("2 · Rainfall-informed advisory")
-forecast = None
 try:
-    forecast = get_forecast(float(lat), float(lon), int(forecast_days))
+    forecast = fetch_forecast(float(lat), float(lon), int(horizon))
     daily = forecast.get("daily", {})
     dates = daily.get("time", [])
-    rain = daily.get("precipitation_sum", [])
-    prob_rain = daily.get("precipitation_probability_max", [None] * len(dates))
+    rainfall = daily.get("precipitation_sum", [])
+    rain_prob = daily.get("precipitation_probability_max", [None] * len(dates))
     rain_df = pd.DataFrame({
         "Date": dates,
-        "Forecast precipitation (mm/day)": rain,
-        "Max precipitation probability (%)": prob_rain
+        "Forecast rainfall (mm/day)": rainfall,
+        "Maximum precipitation probability (%)": rain_prob,
     })
-    rain_df["Forecast precipitation (mm/day)"] = pd.to_numeric(rain_df["Forecast precipitation (mm/day)"], errors="coerce")
-    total_rain = float(rain_df["Forecast precipitation (mm/day)"].fillna(0).sum())
-    max_daily = float(rain_df["Forecast precipitation (mm/day)"].fillna(0).max())
-    c1, c2, c3 = st.columns(3)
-    c1.metric(f"Forecast total · {forecast_days} day(s)", f"{total_rain:.1f} mm")
-    c2.metric("Highest forecast day", f"{max_daily:.1f} mm")
-    c3.metric("Forecast updated", datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"))
-    st.plotly_chart(px.bar(rain_df, x="Date", y="Forecast precipitation (mm/day)", title="Open-Meteo forecast precipitation"), use_container_width=True)
+    rain_df["Forecast rainfall (mm/day)"] = pd.to_numeric(rain_df["Forecast rainfall (mm/day)"], errors="coerce")
+    total = float(rain_df["Forecast rainfall (mm/day)"].fillna(0).sum())
+    max_day = float(rain_df["Forecast rainfall (mm/day)"].fillna(0).max()) if len(rain_df) else 0.0
+    r1, r2, r3 = st.columns(3)
+    r1.metric(f"Total forecast · {horizon} day(s)", f"{total:.1f} mm")
+    r2.metric("Maximum daily rainfall", f"{max_day:.1f} mm")
+    r3.metric("Forecast timezone", str(forecast.get("timezone", "local")))
+    fig = px.bar(
+        rain_df, x="Date", y="Forecast rainfall (mm/day)",
+        title="Daily forecast precipitation",
+        template="plotly_dark",
+        color_discrete_sequence=["#65d6c4"],
+    )
+    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", margin=dict(l=10, r=10, t=55, b=10))
+    st.plotly_chart(fig, use_container_width=True)
     st.dataframe(rain_df, use_container_width=True, hide_index=True)
 
-    # Explicitly provisional rainfall screening bands, not fitted/validated warning thresholds.
-    if total_rain >= 100 or max_daily >= 50:
-        rain_level = "Elevated rainfall screening"
-        rain_color = "🔴"
-        advice = "Check official IMD/local disaster-management bulletins and local slope/drainage conditions."
-    elif total_rain >= 50 or max_daily >= 25:
-        rain_level = "Increased rainfall screening"
-        rain_color = "🟠"
-        advice = "Monitor official forecasts and local conditions; this dashboard cannot confirm a landslide warning."
+    # Transparent provisional thresholds only; not scientifically validated warning thresholds.
+    if total >= 100 or max_day >= 50:
+        rain_band, rain_emoji = "Elevated rainfall screening", "🔴"
+        advice = "Review official IMD forecasts and local disaster-management guidance promptly."
+    elif total >= 50 or max_day >= 25:
+        rain_band, rain_emoji = "Increased rainfall screening", "🟠"
+        advice = "Monitor official forecasts and local slope/drainage conditions."
     else:
-        rain_level = "No high-rainfall flag from these provisional rules"
-        rain_color = "🟢"
-        advice = "Continue to follow official forecasts; low forecast rainfall does not mean no landslide risk."
-    st.markdown(f"### {rain_color} {rain_level}")
+        rain_band, rain_emoji = "No high-rainfall flag from these provisional rules", "🟢"
+        advice = "Continue following official forecasts. Low forecast rainfall does not mean zero landslide risk."
+    st.markdown(f"### {rain_emoji} {rain_band}")
     st.write(advice)
-    st.caption("Rainfall bands are provisional UI rules only. They have not been validated against event/non-event outcomes, probability of detection, false-alarm rate, or lead time.")
-except Exception as e:
-    st.warning(f"Forecast service could not be reached: {e}. Susceptibility screening remains available; rainfall advisory is unavailable.")
+    st.caption("The rainfall bands are illustrative rules only. They have not been calibrated against independent landslide events, false alarms, missed events or warning lead time.")
+except Exception as exc:
+    st.warning(f"Rainfall forecast is temporarily unavailable: {exc}")
 
-st.subheader("3 · Research model evidence")
-st.write(
-    "The research workflow reported spatial cross-validation ROC-AUC around 0.928 for Random Forest "
-    "on recorded events versus sampled background points. That metric describes discrimination in this "
-    "sampling setup; it is not proof of real-world warning accuracy."
-)
-st.write(
-    "Before operational use, validate with independent dated events and non-event periods, event-aligned rainfall, "
-    "distance-aware spatial folds, calibration, false-alarm/missed-event rates, and lead-time analysis."
-)
+# ------------------------------ MODEL EVIDENCE / DATA ------------------------------
+st.markdown("<div class='section-title'>3 · Research context</div>", unsafe_allow_html=True)
+with st.container(border=True):
+    st.markdown("**Existing research result**")
+    st.markdown(
+        "The earlier research workflow reported Random Forest spatial cross-validation ROC-AUC of approximately **0.928** "
+        "for recorded events versus sampled background points. This is a result from that evaluation, not a metric "
+        "measured by this app's newly fitted model."
+    )
+    st.markdown(
+        "**Interpretation:** background samples are not confirmed negatives. The model score is not a calibrated real-world "
+        "probability. Operational use requires independent dated events, non-event periods, spatially independent validation, "
+        "calibration, false-alarm/missed-event metrics and lead-time assessment."
+    )
 
-if training_df is not None:
-    with st.expander("Training data preview"):
-        st.dataframe(training_df.head(20), use_container_width=True)
-    if "landcover_class" in training_df.columns:
-        counts = training_df["landcover_class"].astype(str).value_counts().head(12).rename_axis("Land-cover class").reset_index(name="Rows")
-        st.plotly_chart(px.bar(counts, x="Land-cover class", y="Rows", title="Most frequent land-cover codes in training data"), use_container_width=True)
+with st.expander("Preview training records"):
+    st.dataframe(df.head(30), use_container_width=True)
+with st.expander("Feature names used by the app"):
+    st.code("\n".join(features), language=None)
 
 st.divider()
-st.caption("Research prototype · Not an official warning system · Last app render: " + datetime.now().strftime("%Y-%m-%d %H:%M"))
+st.markdown(
+    f"<div class='muted'>India Landslide Watch · Research prototype · Rendered {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}</div>",
+    unsafe_allow_html=True,
+)
